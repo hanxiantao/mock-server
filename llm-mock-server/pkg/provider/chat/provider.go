@@ -152,7 +152,7 @@ func handleChatCompletions(context *gin.Context) {
 			return
 		}
 	}
-	context.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+	context.JSON(http.StatusNotFound, simpleErrorResponse{Error: "Not found"})
 }
 
 type requestContext struct {
@@ -165,7 +165,7 @@ func buildRequestContext(context *gin.Context) error {
 	body, err := io.ReadAll(context.Request.Body)
 	if err != nil {
 		log.Errorf("Error reading request body:", err)
-		context.JSON(http.StatusBadRequest, gin.H{"error": "Error reading request body"})
+		context.JSON(http.StatusBadRequest, simpleErrorResponse{Error: "Error reading request body"})
 		return err
 	}
 
@@ -175,7 +175,7 @@ func buildRequestContext(context *gin.Context) error {
 	var data map[string]interface{}
 	if err := json.Unmarshal(body, &data); err != nil {
 		log.Errorf("Error unmarshalling JSON:", err)
-		context.JSON(http.StatusBadRequest, gin.H{"error": "Error unmarshalling JSON"})
+		context.JSON(http.StatusBadRequest, simpleErrorResponse{Error: "Error unmarshalling JSON"})
 		return err
 	}
 	model, _ := data["model"].(string)

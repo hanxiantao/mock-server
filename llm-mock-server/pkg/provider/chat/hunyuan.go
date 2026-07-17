@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -22,12 +21,9 @@ const (
 // ai-proxy sends this after converting the client's OpenAI-format request. Only the text-chat
 // subset is modeled; Tools / ToolChoice are not (ai-proxy's hunyuan request does not forward them).
 type hunyuanRequest struct {
-	Model    string `json:"Model"`
-	Messages []struct {
-		Role    string `json:"Role"`
-		Content string `json:"Content"`
-	} `json:"Messages"`
-	Stream bool `json:"Stream"`
+	Model    string                `json:"Model"`
+	Messages []hunyuanInputMessage `json:"Messages"`
+	Stream   bool                  `json:"Stream"`
 }
 
 type hunyuanProvider struct{}
@@ -44,23 +40,19 @@ func (p *hunyuanProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 func (p *hunyuanProvider) HandleChatCompletions(ctx *gin.Context) {
 	// The real API rejects unsigned requests; ai-proxy always sets a TC3 Authorization header.
 	if ctx.GetHeader("Authorization") == "" {
-		ctx.JSON(http.StatusUnauthorized, gin.H{
-			"Response": gin.H{"Error": gin.H{"Code": "AuthFailure", "Message": "missing Authorization"}},
-		})
+		p.sendErrorResponse(ctx, http.StatusUnauthorized, "AuthFailure", "missing Authorization")
 		return
 	}
 	// The native TC3 API is selected by the X-TC-Action / X-TC-Version headers; ai-proxy always
 	// injects them (X-TC-Action: ChatCompletions, X-TC-Version: 2023-09-01).
 	if ctx.GetHeader("X-TC-Action") != "ChatCompletions" || ctx.GetHeader("X-TC-Version") != "2023-09-01" {
-		ctx.JSON(http.StatusBadRequest, gin.H{
-			"Response": gin.H{"Error": gin.H{"Code": "InvalidAction", "Message": "invalid X-TC-Action / X-TC-Version"}},
-		})
+		p.sendErrorResponse(ctx, http.StatusBadRequest, "InvalidAction", "invalid X-TC-Action / X-TC-Version")
 		return
 	}
 
 	var req hunyuanRequest
 	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"Response": gin.H{"Error": gin.H{"Message": err.Error()}}})
+		p.sendErrorResponse(ctx, http.StatusBadRequest, "", err.Error())
 		return
 	}
 	response := lastHunyuanUserText(&req)
@@ -74,25 +66,19 @@ func (p *hunyuanProvider) HandleChatCompletions(ctx *gin.Context) {
 	}
 }
 
-func (p *hunyuanProvider) handleNonStreamResponse(ctx *gin.Context, response string) {
-	ctx.JSON(http.StatusOK, gin.H{
-		"Response": gin.H{
-			"RequestId": completionMockId,
-			"Note":      hunyuanNote,
-			"Id":        completionMockId, // becomes the OpenAI response "id"
-			"Created":   completionMockCreated,
-			"Choices": []gin.H{{
-				"Index":        0,
-				"FinishReason": stopReason,
-				"Message":      gin.H{"Role": roleAssistant, "Content": response},
-			}},
-			"Usage": gin.H{
-				"PromptTokens":     completionMockUsage.PromptTokens,
-				"CompletionTokens": completionMockUsage.CompletionTokens,
-				"TotalTokens":      completionMockUsage.TotalTokens,
+func (p *hunyuanProvider) sendErrorResponse(ctx *gin.Context, statusCode int, code, message string) {
+	ctx.JSON(statusCode, hunyuanErrorEnvelope{
+		Response: hunyuanErrorResponse{
+			Error: &hunyuanError{
+				Code:    code,
+				Message: message,
 			},
 		},
 	})
+}
+
+func (p *hunyuanProvider) handleNonStreamResponse(ctx *gin.Context, response string) {
+	ctx.JSON(http.StatusOK, createHunyuanNonStreamResponse(response))
 }
 
 func (p *hunyuanProvider) handleStreamResponse(ctx *gin.Context, response string) {
@@ -101,29 +87,7 @@ func (p *hunyuanProvider) handleStreamResponse(ctx *gin.Context, response string
 	// Every frame MUST carry a non-empty Choices array: ai-proxy indexes Choices[0]
 	// without a bounds check when converting Hunyuan chunks.
 	send := func(content, finish string) bool {
-		data, _ := json.Marshal(gin.H{
-			"Note":    hunyuanNote,
-			"Id":      completionMockId,
-			"Created": time.Now().Unix(),
-			"Choices": []gin.H{{
-				"Index":        0,
-				"Delta":        gin.H{"Role": roleAssistant, "Content": content},
-				"FinishReason": finish,
-			}},
-			"Usage": gin.H{
-				"PromptTokens":     completionMockUsage.PromptTokens,
-				"CompletionTokens": completionMockUsage.CompletionTokens,
-				"TotalTokens":      completionMockUsage.TotalTokens,
-			},
-		})
-		select {
-		case <-ctx.Request.Context().Done():
-			return false
-		default:
-		}
-		ctx.Render(-1, streamEvent{Data: "data: " + string(data)})
-		ctx.Writer.Flush()
-		return true
+		return renderJSONStreamEvent(ctx, createHunyuanStreamResponse(content, finish))
 	}
 
 	// One content delta per rune, then a terminal frame with finish_reason "stop" (native
@@ -141,6 +105,55 @@ func (p *hunyuanProvider) handleStreamResponse(ctx *gin.Context, response string
 	send("", stopReason)
 }
 
+func createHunyuanNonStreamResponse(response string) hunyuanResponseEnvelope {
+	return hunyuanResponseEnvelope{
+		Response: hunyuanResponse{
+			RequestId: completionMockId,
+			Note:      hunyuanNote,
+			Id:        completionMockId,
+			Created:   completionMockCreated,
+			Choices: []hunyuanChoice{
+				{
+					Index:        0,
+					FinishReason: stopReason,
+					Message: &hunyuanMessage{
+						Role:    roleAssistant,
+						Content: response,
+					},
+				},
+			},
+			Usage: createHunyuanUsage(),
+		},
+	}
+}
+
+func createHunyuanStreamResponse(content, finish string) hunyuanStreamResponse {
+	return hunyuanStreamResponse{
+		Note:    hunyuanNote,
+		Id:      completionMockId,
+		Created: time.Now().Unix(),
+		Choices: []hunyuanChoice{
+			{
+				Index:        0,
+				FinishReason: finish,
+				Delta: &hunyuanMessage{
+					Role:    roleAssistant,
+					Content: content,
+				},
+			},
+		},
+		Usage: createHunyuanUsage(),
+	}
+}
+
+func createHunyuanUsage() hunyuanUsage {
+	return hunyuanUsage{
+		PromptTokens:     completionMockUsage.PromptTokens,
+		CompletionTokens: completionMockUsage.CompletionTokens,
+		TotalTokens:      completionMockUsage.TotalTokens,
+	}
+}
+
 func lastHunyuanUserText(req *hunyuanRequest) string {
 	if len(req.Messages) == 0 {
 		return ""
@@ -151,4 +164,61 @@ func lastHunyuanUserText(req *hunyuanRequest) string {
 		}
 	}
 	return req.Messages[len(req.Messages)-1].Content
+}
+
+type hunyuanInputMessage struct {
+	Role    string `json:"Role"`
+	Content string `json:"Content"`
+}
+
+type hunyuanErrorEnvelope struct {
+	Response hunyuanErrorResponse `json:"Response"`
+}
+
+type hunyuanErrorResponse struct {
+	Error *hunyuanError `json:"Error,omitempty"`
+}
+
+type hunyuanError struct {
+	Code    string `json:"Code,omitempty"`
+	Message string `json:"Message,omitempty"`
+}
+
+type hunyuanResponseEnvelope struct {
+	Response hunyuanResponse `json:"Response"`
+}
+
+type hunyuanResponse struct {
+	RequestId string          `json:"RequestId"`
+	Note      string          `json:"Note"`
+	Id        string          `json:"Id"`
+	Created   int64           `json:"Created"`
+	Choices   []hunyuanChoice `json:"Choices"`
+	Usage     hunyuanUsage    `json:"Usage"`
+}
+
+type hunyuanStreamResponse struct {
+	Note    string          `json:"Note"`
+	Id      string          `json:"Id"`
+	Created int64           `json:"Created"`
+	Choices []hunyuanChoice `json:"Choices"`
+	Usage   hunyuanUsage    `json:"Usage"`
+}
+
+type hunyuanChoice struct {
+	Index        int             `json:"Index"`
+	FinishReason string          `json:"FinishReason,omitempty"`
+	Message      *hunyuanMessage `json:"Message,omitempty"`
+	Delta        *hunyuanMessage `json:"Delta,omitempty"`
+}
+
+type hunyuanMessage struct {
+	Role    string `json:"Role"`
+	Content string `json:"Content"`
+}
+
+type hunyuanUsage struct {
+	PromptTokens     int `json:"PromptTokens"`
+	CompletionTokens int `json:"CompletionTokens"`
+	TotalTokens      int `json:"TotalTokens"`
 }

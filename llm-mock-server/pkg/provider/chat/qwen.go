@@ -3,10 +3,12 @@ package chat
 import (
 	"fmt"
 	"net/http"
+	"time"
+
+	"llm-mock-server/pkg/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
-	"llm-mock-server/pkg/utils"
 )
 
 const (
@@ -15,40 +17,30 @@ const (
 	qwenResultFormatMessage = "message"
 )
 
-type qwenProvider struct {
-}
+type qwenProvider struct{}
 
 func (p *qwenProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 	context, _ := getRequestContext(ctx)
-	if context.Host == qwenDomain && context.Path == qwenChatCompletionPath {
-		return true
-	}
-	return false
+	return context.Host == qwenDomain && context.Path == qwenChatCompletionPath
 }
 
 func (p *qwenProvider) HandleChatCompletions(ctx *gin.Context) {
-	// Validate Authorization header
 	authHeader := ctx.GetHeader("Authorization")
 	if authHeader == "" {
-		p.sendErrorResponse(ctx, http.StatusUnauthorized,
-			"InvalidApiKey", "No API-key provided.")
+		p.sendErrorResponse(ctx, http.StatusUnauthorized, "InvalidApiKey", "No API-key provided.")
 		return
 	}
 
-	// Bind request body
 	var chatRequest qwenTextGenRequest
 	if err := ctx.ShouldBindJSON(&chatRequest); err != nil {
-		p.sendErrorResponse(ctx, http.StatusBadRequest,
-			"InvalidParameter", fmt.Sprintf("invalid params: %v", err.Error()))
+		p.sendErrorResponse(ctx, http.StatusBadRequest, "InvalidParameter", fmt.Sprintf("invalid params: %v", err.Error()))
 		return
 	}
 
-	// Validate request body
 	if err := utils.Validate.Struct(chatRequest); err != nil {
 		validationErrors := err.(validator.ValidationErrors)
 		for _, fieldError := range validationErrors {
-			p.sendErrorResponse(ctx, http.StatusBadRequest,
-				"InvalidParameter", fmt.Sprintf("invalid params: %v", fieldError.Error()))
+			p.sendErrorResponse(ctx, http.StatusBadRequest, "InvalidParameter", fmt.Sprintf("invalid params: %v", fieldError.Error()))
 			return
 		}
 	}
@@ -60,23 +52,58 @@ func (p *qwenProvider) HandleChatCompletions(ctx *gin.Context) {
 	}
 	response := prompt2Response(prompt)
 
-	// Determine if the request is a stream request
-	isStream := p.isStreamRequest(ctx)
-
-	if isStream {
-		// todo stream response
+	if p.isStreamRequest(ctx) {
+		p.handleStreamResponse(ctx, chatRequest, response)
 	} else {
 		p.handleNonStreamResponse(ctx, chatRequest, response)
 	}
 }
 
 func (p *qwenProvider) sendErrorResponse(ctx *gin.Context, statusCode int, errorCode, errorMsg string) {
-	errorResp := qwenErrorResp{
+	ctx.JSON(statusCode, qwenErrorResp{
 		Code:      errorCode,
 		Message:   errorMsg,
 		RequestId: completionMockId,
+	})
+}
+
+func (p *qwenProvider) handleStreamResponse(ctx *gin.Context, chatRequest qwenTextGenRequest, response string) {
+	utils.SetEventStreamHeaders(ctx)
+
+	accumulated := ""
+	incrementalOutput := chatRequest.Parameters.IncrementalOutput
+
+	for _, r := range []rune(response) {
+		select {
+		case <-ctx.Request.Context().Done():
+			return
+		default:
+		}
+
+		piece := string(r)
+		if incrementalOutput {
+			accumulated = piece
+		} else {
+			accumulated += piece
+		}
+
+		chunk := createQwenStreamResponse(chatRequest, accumulated, "")
+		if !renderJSONStreamEvent(ctx, chunk) {
+			return
+		}
+
+		select {
+		case <-ctx.Request.Context().Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	ctx.JSON(statusCode, errorResp)
+
+	renderJSONStreamEvent(ctx, createQwenStreamResponse(chatRequest, "", stopReason))
+}
+
+func (p *qwenProvider) handleNonStreamResponse(ctx *gin.Context, chatRequest qwenTextGenRequest, response string) {
+	ctx.JSON(http.StatusOK, createQwenTextGenResponse(chatRequest, response))
 }
 
 // isStreamRequest checks if the request is a stream request.
@@ -84,16 +111,52 @@ func (p *qwenProvider) isStreamRequest(ctx *gin.Context) bool {
 	acceptHeader := ctx.GetHeader("Accept")
 	sseHeader := ctx.GetHeader("X-DashScope-SSE")
 
-	// Check if Accept header is text/event-stream or X-DashScope-SSE is set to enable
-	if acceptHeader == "text/event-stream" || sseHeader == "enable" {
-		return true
-	}
-	return false
+	return acceptHeader == "text/event-stream" || sseHeader == "enable"
 }
 
-func (p *qwenProvider) handleNonStreamResponse(ctx *gin.Context, chatRequest qwenTextGenRequest, response string) {
-	completion := createQwenTextGenResponse(chatRequest, response)
-	ctx.JSON(http.StatusOK, completion)
+func createQwenTextGenResponse(chatRequest qwenTextGenRequest, response string) qwenTextGenResponse {
+	return qwenTextGenResponse{
+		RequestId: completionMockId,
+		Output:    createQwenTextGenOutput(chatRequest, response, stopReason),
+		Usage:     createQwenUsage(),
+	}
+}
+
+func createQwenStreamResponse(chatRequest qwenTextGenRequest, response, finishReason string) qwenTextGenResponse {
+	return qwenTextGenResponse{
+		RequestId: completionMockId,
+		Output:    createQwenTextGenOutput(chatRequest, response, finishReason),
+		Usage:     createQwenUsage(),
+	}
+}
+
+func createQwenTextGenOutput(chatRequest qwenTextGenRequest, response, finishReason string) qwenTextGenOutput {
+	if chatRequest.Parameters.ResultFormat == "" || chatRequest.Parameters.ResultFormat == qwenResultFormatMessage {
+		return qwenTextGenOutput{
+			Choices: []qwenTextGenChoice{
+				{
+					FinishReason: finishReason,
+					Message: qwenMessage{
+						Role:    roleAssistant,
+						Content: response,
+					},
+				},
+			},
+		}
+	}
+
+	return qwenTextGenOutput{
+		FinishReason: finishReason,
+		Text:         response,
+	}
+}
+
+func createQwenUsage() qwenUsage {
+	return qwenUsage{
+		InputTokens:  completionMockUsage.PromptTokens,
+		OutputTokens: completionMockUsage.CompletionTokens,
+		TotalTokens:  completionMockUsage.TotalTokens,
+	}
 }
 
 type qwenErrorResp struct {
@@ -103,13 +166,13 @@ type qwenErrorResp struct {
 }
 
 type qwenTextGenRequest struct {
-	Model      string                `json:"model"`
-	Input      qwenTextGenInput      `json:"input"`
+	Model      string                `json:"model" validate:"required"`
+	Input      qwenTextGenInput      `json:"input" validate:"required"`
 	Parameters qwenTextGenParameters `json:"parameters,omitempty"`
 }
 
 type qwenTextGenInput struct {
-	Messages []qwenMessage `json:"messages"`
+	Messages []qwenMessage `json:"messages" validate:"required,min=1"`
 }
 
 type qwenTextGenParameters struct {
@@ -129,37 +192,6 @@ type qwenTextGenResponse struct {
 	RequestId string            `json:"request_id"`
 	Output    qwenTextGenOutput `json:"output"`
 	Usage     qwenUsage         `json:"usage"`
-}
-
-func createQwenTextGenResponse(chatRequest qwenTextGenRequest, response string) qwenTextGenResponse {
-	var output qwenTextGenOutput
-	if chatRequest.Parameters.ResultFormat == qwenResultFormatMessage {
-		output = qwenTextGenOutput{
-			Choices: []qwenTextGenChoice{
-				{
-					FinishReason: stopReason,
-					Message: qwenMessage{
-						Role:    roleAssistant,
-						Content: response,
-					},
-				},
-			},
-		}
-	} else {
-		output = qwenTextGenOutput{
-			FinishReason: stopReason,
-			Text:         response,
-		}
-	}
-	return qwenTextGenResponse{
-		Output: output,
-		Usage: qwenUsage{
-			InputTokens:  9,
-			OutputTokens: 1,
-			TotalTokens:  10,
-		},
-		RequestId: completionMockId,
-	}
 }
 
 type qwenTextGenOutput struct {

@@ -38,22 +38,45 @@ func (p *deeplProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 func (p *deeplProvider) HandleChatCompletions(ctx *gin.Context) {
 	// The real DeepL API authenticates with "Authorization: DeepL-Auth-Key <key>"; ai-proxy injects it.
 	if ctx.GetHeader("Authorization") == "" {
-		ctx.JSON(http.StatusUnauthorized, gin.H{"message": "invalid api token"})
+		p.sendErrorResponse(ctx, http.StatusUnauthorized, "invalid api token")
 		return
 	}
 
 	var req deeplRequest
 	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		p.sendErrorResponse(ctx, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// DeepL returns one translation per input text; echo each entry back.
-	translations := make([]gin.H, 0, len(req.Text))
-	for _, t := range req.Text {
-		translations = append(translations, gin.H{"detected_source_language": deeplDetectedSource, "text": t})
-	}
-
 	// DeepL translation is non-streaming; ai-proxy converts this to an OpenAI chat.completion.
-	ctx.JSON(http.StatusOK, gin.H{"translations": translations})
+	ctx.JSON(http.StatusOK, createDeeplTranslateResponse(req.Text))
+}
+
+func (p *deeplProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
+	ctx.JSON(statusCode, deeplErrorResponse{Message: message})
+}
+
+func createDeeplTranslateResponse(texts []string) deeplTranslateResponse {
+	translations := make([]deeplTranslation, 0, len(texts))
+	for _, text := range texts {
+		translations = append(translations, deeplTranslation{
+			DetectedSourceLanguage: deeplDetectedSource,
+			Text:                   text,
+		})
+	}
+	return deeplTranslateResponse{Translations: translations}
+}
+
+type deeplErrorResponse struct {
+	Message string `json:"message"`
+}
+
+type deeplTranslateResponse struct {
+	Translations []deeplTranslation `json:"translations"`
+}
+
+type deeplTranslation struct {
+	DetectedSourceLanguage string `json:"detected_source_language"`
+	Text                   string `json:"text"`
 }

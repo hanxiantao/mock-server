@@ -41,12 +41,7 @@ func (p *moonshotProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 func (p *moonshotProvider) HandleChatCompletions(ctx *gin.Context) {
 	// The real moonshot API requires "Authorization: Bearer <api key>"; the error body mirrors the actual API response.
 	if !strings.HasPrefix(ctx.GetHeader("Authorization"), "Bearer ") {
-		ctx.JSON(http.StatusUnauthorized, gin.H{
-			"error": gin.H{
-				"message": "Incorrect API key provided",
-				"type":    "incorrect_api_key_error",
-			},
-		})
+		p.sendErrorResponse(ctx, http.StatusUnauthorized, "Incorrect API key provided", "incorrect_api_key_error")
 		return
 	}
 
@@ -59,8 +54,17 @@ func (p *moonshotProvider) HandleChatCompletions(ctx *gin.Context) {
 	if chatRequest.Stream {
 		p.handleStreamResponse(ctx, chatRequest, response)
 	} else {
-		ctx.JSON(http.StatusOK, createChatCompletionResponse(chatRequest.Model, response))
+		p.handleNonStreamResponse(ctx, chatRequest, response)
 	}
+}
+
+func (p *moonshotProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message, errorType string) {
+	ctx.JSON(statusCode, moonshotErrorResponse{
+		Error: moonshotErrorDetail{
+			Message: message,
+			Type:    errorType,
+		},
+	})
 }
 
 func (p *moonshotProvider) handleStreamResponse(ctx *gin.Context, chatRequest chatCompletionRequest, response string) {
@@ -124,4 +128,17 @@ func (p *moonshotProvider) handleStreamResponse(ctx *gin.Context, chatRequest ch
 			return false
 		}
 	})
+}
+
+func (p *moonshotProvider) handleNonStreamResponse(ctx *gin.Context, chatRequest chatCompletionRequest, response string) {
+	ctx.JSON(http.StatusOK, createChatCompletionResponse(chatRequest.Model, response))
+}
+
+type moonshotErrorResponse struct {
+	Error moonshotErrorDetail `json:"error"`
+}
+
+type moonshotErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
 }

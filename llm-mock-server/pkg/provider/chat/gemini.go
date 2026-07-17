@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"encoding/json"
 	"fmt"
 	"llm-mock-server/pkg/log"
 	"net/http"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"llm-mock-server/pkg/utils"
 )
 
 const (
@@ -125,11 +125,7 @@ func (p *geminiProvider) generateResponse(req *geminiGenerateContentRequest) str
 }
 
 func (p *geminiProvider) handleStreamResponse(ctx *gin.Context, req *geminiGenerateContentRequest, response string) {
-	// Set streaming response headers
-	ctx.Header("Content-Type", "text/event-stream")
-	ctx.Header("Cache-Control", "no-cache")
-	ctx.Header("Connection", "keep-alive")
-	ctx.Header("Access-Control-Allow-Origin", "*")
+	utils.SetEventStreamHeaders(ctx)
 
 	// Split the reply into words and stream them
 	words := strings.Fields(response)
@@ -142,40 +138,16 @@ func (p *geminiProvider) handleStreamResponse(ctx *gin.Context, req *geminiGener
 		default:
 		}
 
-		chunk := geminiGenerateContentResponse{
-			Candidates: []geminiCandidate{
-				{
-					Content: geminiContent{
-						Parts: []geminiPart{
-							{Text: word + " "},
-						},
-						Role: "model",
-					},
-					Index: 0,
-				},
-			},
-			UsageMetadata: &geminiUsageMetadata{
-				PromptTokenCount:     completionMockUsage.PromptTokens,
-				CandidatesTokenCount: completionMockUsage.CompletionTokens,
-				TotalTokenCount:      completionMockUsage.TotalTokens,
-			},
-		}
+		chunk := createGeminiGenerateContentResponse(word+" ", false)
 
 		// The final chunk carries the finish reason
 		if i == totalWords-1 {
 			chunk.Candidates[0].FinishReason = "STOP"
 		}
 
-		// Send the data chunk, in the same way as the OpenAI provider
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal response"})
+		if !renderJSONStreamEvent(ctx, chunk) {
 			return
 		}
-
-		// Render SSE data via streamEvent and flush immediately so each event arrives on its own
-		ctx.Render(-1, streamEvent{Data: "data: " + string(data)})
-		ctx.Writer.Flush()
 
 		select {
 		case <-ctx.Request.Context().Done():
@@ -186,36 +158,15 @@ func (p *geminiProvider) handleStreamResponse(ctx *gin.Context, req *geminiGener
 }
 
 func (p *geminiProvider) handleNonStreamResponse(ctx *gin.Context, req *geminiGenerateContentRequest, response string) {
-	// Build the non-streaming response
-	geminiResponse := geminiGenerateContentResponse{
-		Candidates: []geminiCandidate{
-			{
-				Content: geminiContent{
-					Parts: []geminiPart{
-						{Text: response},
-					},
-					Role: "model",
-				},
-				FinishReason: "STOP",
-				Index:        0,
-			},
-		},
-		UsageMetadata: &geminiUsageMetadata{
-			PromptTokenCount:     completionMockUsage.PromptTokens,
-			CandidatesTokenCount: completionMockUsage.CompletionTokens,
-			TotalTokenCount:      completionMockUsage.TotalTokens,
-		},
-	}
-
-	ctx.JSON(http.StatusOK, geminiResponse)
+	ctx.JSON(http.StatusOK, createGeminiGenerateContentResponse(response, true))
 }
 
 func (p *geminiProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
-	ctx.JSON(statusCode, gin.H{
-		"error": gin.H{
-			"code":    statusCode,
-			"message": message,
-			"status":  geminiErrorStatus(statusCode),
+	ctx.JSON(statusCode, geminiErrorResponse{
+		Error: geminiErrorDetail{
+			Code:    statusCode,
+			Message: message,
+			Status:  geminiErrorStatus(statusCode),
 		},
 	})
 }
@@ -281,4 +232,36 @@ type geminiUsageMetadata struct {
 	PromptTokenCount     int `json:"promptTokenCount"`
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+func createGeminiGenerateContentResponse(response string, finished bool) geminiGenerateContentResponse {
+	candidate := geminiCandidate{
+		Content: geminiContent{
+			Parts: []geminiPart{{Text: response}},
+			Role:  "model",
+		},
+		Index: 0,
+	}
+	if finished {
+		candidate.FinishReason = "STOP"
+	}
+
+	return geminiGenerateContentResponse{
+		Candidates: []geminiCandidate{candidate},
+		UsageMetadata: &geminiUsageMetadata{
+			PromptTokenCount:     completionMockUsage.PromptTokens,
+			CandidatesTokenCount: completionMockUsage.CompletionTokens,
+			TotalTokenCount:      completionMockUsage.TotalTokens,
+		},
+	}
+}
+
+type geminiErrorResponse struct {
+	Error geminiErrorDetail `json:"error"`
+}
+
+type geminiErrorDetail struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
 }

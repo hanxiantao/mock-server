@@ -70,12 +70,11 @@ func (p *minimaxProvider) HandleChatCompletions(ctx *gin.Context) {
 }
 
 func (p *minimaxProvider) sendErrorResponse(ctx *gin.Context, respCode int, respMsg string) {
-	baseResp := minimaxBaseResp{
-		StatusCode: int64(respCode),
-		StatusMsg:  respMsg,
-	}
-	ctx.JSON(http.StatusOK, gin.H{
-		"base_resp": baseResp,
+	ctx.JSON(http.StatusOK, minimaxErrorResponse{
+		BaseResp: minimaxBaseResp{
+			StatusCode: int64(respCode),
+			StatusMsg:  respMsg,
+		},
 	})
 }
 
@@ -205,6 +204,10 @@ type minimaxChatCompletionProResp struct {
 type minimaxBaseResp struct {
 	StatusCode int64  `json:"status_code"`
 	StatusMsg  string `json:"status_msg"`
+}
+
+type minimaxErrorResponse struct {
+	BaseResp minimaxBaseResp `json:"base_resp"`
 }
 
 // minimaxChoice represents a result option.

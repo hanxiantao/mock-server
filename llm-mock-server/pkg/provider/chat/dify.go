@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -81,31 +80,29 @@ func (p *difyProvider) HandleChatCompletions(ctx *gin.Context) {
 }
 
 func (p *difyProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
-	ctx.JSON(statusCode, gin.H{
-		"error": gin.H{
-			"message": message,
-			"type":    "invalid_request_error",
-			"code":    "invalid_request",
+	ctx.JSON(statusCode, difyErrorResponse{
+		Error: difyErrorDetail{
+			Message: message,
+			Type:    "invalid_request_error",
+			Code:    "invalid_request",
 		},
 	})
 }
 
 func (p *difyProvider) handleStreamResponse(ctx *gin.Context, chatRequest difyChatRequest, botType string, reply string) {
 	utils.SetEventStreamHeaders(ctx)
-	dataChan := make(chan string)
+	dataChan := make(chan difyChunkChatResponse)
 	stopChan := make(chan bool, 1)
 
 	go func() {
 		for _, s := range reply {
-			response := difyChunkChatResponse{
+			dataChan <- difyChunkChatResponse{
 				Event:          "agent_thought",
 				Answer:         string(s),
 				ConversationId: completionMockId,
 				MessageId:      completionMockId,
 				CreatedAt:      completionMockCreated,
 			}
-			jsonStr, _ := json.Marshal(response)
-			dataChan <- string(jsonStr)
 
 			// Simulate response delay
 			time.Sleep(200 * time.Millisecond)
@@ -116,37 +113,40 @@ func (p *difyProvider) handleStreamResponse(ctx *gin.Context, chatRequest difyCh
 	ctx.Stream(func(w io.Writer) bool {
 		select {
 		case data := <-dataChan:
-			ctx.Render(-1, streamEvent{Data: "data: " + data})
-			return true
+			return renderJSONStreamEvent(ctx, data)
 		case <-stopChan:
-			// Send final message with metadata
-			finalResponse := difyChunkChatResponse{
-				Event:          "message_end",
-				Answer:         reply,
-				ConversationId: completionMockId,
-				MessageId:      completionMockId,
-				MetaData: difyMetaData{
-					Usage: completionMockUsage,
-				},
-			}
-			jsonStr, _ := json.Marshal(finalResponse)
-			ctx.Render(-1, streamEvent{Data: fmt.Sprintf("data: %s", jsonStr)})
+			renderJSONStreamEvent(ctx, createDifyStreamEndResponse(reply))
 			return false
 		}
 	})
 }
 
 func (p *difyProvider) handleNonStreamResponse(ctx *gin.Context, chatRequest difyChatRequest, botType string, reply string) {
-	response := difyChatResponse{
+	ctx.JSON(http.StatusOK, createDifyChatResponse(chatRequest.ConversationId, reply))
+}
+
+func createDifyChatResponse(conversationId, reply string) difyChatResponse {
+	return difyChatResponse{
 		Answer:         reply,
-		ConversationId: chatRequest.ConversationId,
+		ConversationId: conversationId,
 		MessageId:      completionMockId,
 		CreatedAt:      completionMockCreated,
 		MetaData: difyMetaData{
 			Usage: completionMockUsage,
 		},
 	}
-	ctx.JSON(http.StatusOK, response)
+}
+
+func createDifyStreamEndResponse(reply string) difyChunkChatResponse {
+	return difyChunkChatResponse{
+		Event:          "message_end",
+		Answer:         reply,
+		ConversationId: completionMockId,
+		MessageId:      completionMockId,
+		MetaData: difyMetaData{
+			Usage: completionMockUsage,
+		},
+	}
 }
 
 type difyChatRequest struct {
@@ -156,6 +156,16 @@ type difyChatRequest struct {
 	User             string                 `json:"user"`
 	AutoGenerateName bool                   `json:"auto_generate_name"`
 	ConversationId   string                 `json:"conversation_id"`
+}
+
+type difyErrorResponse struct {
+	Error difyErrorDetail `json:"error"`
+}
+
+type difyErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
 }
 
 type difyMetaData struct {

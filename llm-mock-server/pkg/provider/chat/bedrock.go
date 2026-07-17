@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
-	"llm-mock-server/pkg/log"
 	"net/http"
 	"strings"
 	"time"
+
+	"llm-mock-server/pkg/log"
 
 	"github.com/gin-gonic/gin"
 )
@@ -33,8 +34,6 @@ func (p *bedrockProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 		return false
 	}
 
-	// ai-proxy transforms OpenAI chat completion requests into Bedrock Converse
-	// /model/{modelId}/converse(-stream) before reaching the mock.
 	host := requestCtx.Host
 	path := requestCtx.Path
 	if !strings.Contains(host, bedrockHostFragment) || !strings.Contains(host, bedrockDomainFragment) {
@@ -44,9 +43,6 @@ func (p *bedrockProvider) ShouldHandleRequest(ctx *gin.Context) bool {
 }
 
 func (p *bedrockProvider) HandleChatCompletions(ctx *gin.Context) {
-	// Bedrock auth (SigV4 with AK/SK, or apiTokens as x-api-key / Bearer) is not
-	// enforced: ai-proxy's apiTokens mode sends a Bearer/x-api-key the mock has no
-	// need to validate, and the mock simulates the protocol rather than credentials.
 	isStreaming := strings.HasSuffix(ctx.Request.URL.Path, bedrockConverseStream)
 
 	var bedrockRequest bedrockConverseRequest
@@ -69,6 +65,10 @@ func (p *bedrockProvider) HandleChatCompletions(ctx *gin.Context) {
 	}
 }
 
+func (p *bedrockProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
+	ctx.JSON(statusCode, bedrockErrorResponse{Message: message})
+}
+
 func (p *bedrockProvider) validateRequest(req *bedrockConverseRequest) error {
 	if len(req.Messages) == 0 {
 		return fmt.Errorf("messages are required")
@@ -87,8 +87,6 @@ func (p *bedrockProvider) validateRequest(req *bedrockConverseRequest) error {
 }
 
 func (p *bedrockProvider) generateResponse(req *bedrockConverseRequest) string {
-	// Mirror the gemini/vertex mocks so the response is identifiable as the
-	// Bedrock simulation.
 	content := "This is a mock response from Bedrock provider. "
 	if len(req.Messages) > 0 {
 		lastMsg := req.Messages[len(req.Messages)-1]
@@ -105,24 +103,10 @@ func (p *bedrockProvider) generateResponse(req *bedrockConverseRequest) string {
 }
 
 func (p *bedrockProvider) handleNonStreamResponse(ctx *gin.Context, response string) {
-	// Schema matches Bedrock Converse (output.message.content[].text / stopReason /
-	// usage), which ai-proxy parses into an OpenAI response.
-	bedrockResponse := bedrockConverseResponse{
-		Metrics:    bedrockConverseMetrics{LatencyMs: 100},
-		Output:     bedrockConverseOutput{Message: bedrockConverseMessage{Role: "assistant", Content: []bedrockContentBlock{{Text: response}}}},
-		StopReason: bedrockStopReasonEndTurn,
-		Usage: bedrockTokenUsage{
-			InputTokens:  completionMockUsage.PromptTokens,
-			OutputTokens: completionMockUsage.CompletionTokens,
-			TotalTokens:  completionMockUsage.TotalTokens,
-		},
-	}
-	ctx.JSON(http.StatusOK, bedrockResponse)
+	ctx.JSON(http.StatusOK, createBedrockConverseResponse(response))
 }
 
 func (p *bedrockProvider) handleStreamResponse(ctx *gin.Context, response string) {
-	// Bedrock converse-stream uses the Amazon Event Stream binary framing, not
-	// SSE/JSON. Encode each ConverseStreamEvent as an event-stream message.
 	ctx.Header("Content-Type", "application/vnd.amazon.eventstream")
 	ctx.Header("Cache-Control", "no-cache")
 	ctx.Header("Connection", "keep-alive")
@@ -132,9 +116,9 @@ func (p *bedrockProvider) handleStreamResponse(ctx *gin.Context, response string
 	flusher, ok := ctx.Writer.(http.Flusher)
 
 	for i, word := range words {
-		deltaPayload, _ := json.Marshal(map[string]interface{}{
-			"contentBlockIndex": 0,
-			"delta":             map[string]string{"text": word + " "},
+		deltaPayload, _ := json.Marshal(bedrockContentBlockDeltaEvent{
+			ContentBlockIndex: 0,
+			Delta:             bedrockDeltaText{Text: word + " "},
 		})
 		ctx.Writer.Write(encodeBedrockEventStreamMessage("contentBlockDelta", deltaPayload))
 		if ok {
@@ -146,9 +130,8 @@ func (p *bedrockProvider) handleStreamResponse(ctx *gin.Context, response string
 		default:
 		}
 
-		// The final word is followed by a messageStop carrying the stop reason.
 		if i == len(words)-1 {
-			stopPayload, _ := json.Marshal(map[string]string{"stopReason": bedrockStopReasonEndTurn})
+			stopPayload, _ := json.Marshal(bedrockMessageStopEvent{StopReason: bedrockStopReasonEndTurn})
 			ctx.Writer.Write(encodeBedrockEventStreamMessage("messageStop", stopPayload))
 			if ok {
 				flusher.Flush()
@@ -162,16 +145,21 @@ func (p *bedrockProvider) handleStreamResponse(ctx *gin.Context, response string
 	}
 }
 
-func (p *bedrockProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
-	ctx.JSON(statusCode, gin.H{
-		"message": message,
-	})
+func createBedrockConverseResponse(response string) bedrockConverseResponse {
+	return bedrockConverseResponse{
+		Metrics:    bedrockConverseMetrics{LatencyMs: 100},
+		Output:     bedrockConverseOutput{Message: bedrockConverseMessage{Role: "assistant", Content: []bedrockContentBlock{{Text: response}}}},
+		StopReason: bedrockStopReasonEndTurn,
+		Usage: bedrockTokenUsage{
+			InputTokens:  completionMockUsage.PromptTokens,
+			OutputTokens: completionMockUsage.CompletionTokens,
+			TotalTokens:  completionMockUsage.TotalTokens,
+		},
+	}
 }
 
 // encodeBedrockEventStreamMessage builds a single AWS Event Stream message frame:
 // [TotalLength:4][HeadersLength:4][PreludeCRC:4][Headers][Payload][MessageCRC:4].
-// All integers are big-endian; CRCs are CRC32-IEEE. This mirrors the framing
-// ai-proxy's bedrock provider decodes (see extractAmazonEventStreamEvents).
 func encodeBedrockEventStreamMessage(eventType string, payload []byte) []byte {
 	headers := encodeBedrockEventStreamHeaders(eventType)
 	headersLen := len(headers)
@@ -197,14 +185,13 @@ func encodeBedrockEventStreamMessage(eventType string, payload []byte) []byte {
 }
 
 // encodeBedrockEventStreamHeaders encodes the three headers ai-proxy expects on
-// an event frame: :message-type=event, :event-type=<eventType>,
-// :content-type=application/json. String values use type byte 7.
+// an event frame.
 func encodeBedrockEventStreamHeaders(eventType string) []byte {
 	var buf bytes.Buffer
 	writeHeader := func(name, value string) {
 		buf.WriteByte(byte(len(name)))
 		buf.WriteString(name)
-		buf.WriteByte(7) // type: string
+		buf.WriteByte(7)
 		lenBuf := make([]byte, 2)
 		binary.BigEndian.PutUint16(lenBuf, uint16(len(value)))
 		buf.Write(lenBuf)
@@ -216,9 +203,6 @@ func encodeBedrockEventStreamHeaders(eventType string) []byte {
 	return buf.Bytes()
 }
 
-// Bedrock Converse request / response data structures. The request schema matches
-// what ai-proxy produces after transforming an OpenAI request; the response
-// schema matches what ai-proxy parses back into an OpenAI response.
 type bedrockConverseRequest struct {
 	Messages []bedrockRequestMessage `json:"messages"`
 }
@@ -260,4 +244,21 @@ type bedrockTokenUsage struct {
 	InputTokens  int `json:"inputTokens,omitempty"`
 	OutputTokens int `json:"outputTokens,omitempty"`
 	TotalTokens  int `json:"totalTokens"`
+}
+
+type bedrockErrorResponse struct {
+	Message string `json:"message"`
+}
+
+type bedrockContentBlockDeltaEvent struct {
+	ContentBlockIndex int              `json:"contentBlockIndex"`
+	Delta             bedrockDeltaText `json:"delta"`
+}
+
+type bedrockDeltaText struct {
+	Text string `json:"text"`
+}
+
+type bedrockMessageStopEvent struct {
+	StopReason string `json:"stopReason"`
 }

@@ -1,12 +1,13 @@
 package chat
 
 import (
-	"encoding/json"
 	"fmt"
-	"llm-mock-server/pkg/log"
 	"net/http"
 	"strings"
 	"time"
+
+	"llm-mock-server/pkg/log"
+	"llm-mock-server/pkg/utils"
 
 	"github.com/gin-gonic/gin"
 )
@@ -134,11 +135,7 @@ func (p *vertexProvider) generateResponse(req *vertexGenerateContentRequest) str
 }
 
 func (p *vertexProvider) handleStreamResponse(ctx *gin.Context, response string) {
-	// Set streaming response headers
-	ctx.Header("Content-Type", "text/event-stream")
-	ctx.Header("Cache-Control", "no-cache")
-	ctx.Header("Connection", "keep-alive")
-	ctx.Header("Access-Control-Allow-Origin", "*")
+	utils.SetEventStreamHeaders(ctx)
 
 	// Split the reply into words and stream them
 	words := strings.Fields(response)
@@ -151,39 +148,16 @@ func (p *vertexProvider) handleStreamResponse(ctx *gin.Context, response string)
 		default:
 		}
 
-		chunk := vertexGenerateContentResponse{
-			Candidates: []vertexCandidate{
-				{
-					Content: vertexContent{
-						Parts: []vertexPart{
-							{Text: word + " "},
-						},
-						Role: "model",
-					},
-					Index: 0,
-				},
-			},
-			UsageMetadata: &vertexUsageMetadata{
-				PromptTokenCount:     completionMockUsage.PromptTokens,
-				CandidatesTokenCount: completionMockUsage.CompletionTokens,
-				TotalTokenCount:      completionMockUsage.TotalTokens,
-			},
-		}
+		chunk := createVertexGenerateContentResponse(word+" ", false)
 
 		// The final chunk carries the finish reason
 		if i == totalWords-1 {
 			chunk.Candidates[0].FinishReason = "STOP"
 		}
 
-		// Send the data chunk and flush immediately so each event arrives on its own
-		data, err := json.Marshal(chunk)
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal response"})
+		if !renderJSONStreamEvent(ctx, chunk) {
 			return
 		}
-
-		ctx.Render(-1, streamEvent{Data: "data: " + string(data)})
-		ctx.Writer.Flush()
 
 		select {
 		case <-ctx.Request.Context().Done():
@@ -194,39 +168,15 @@ func (p *vertexProvider) handleStreamResponse(ctx *gin.Context, response string)
 }
 
 func (p *vertexProvider) handleNonStreamResponse(ctx *gin.Context, response string) {
-	// Build the non-streaming response. The schema matches what ai-proxy's vertex
-	// provider parses (responseId / candidates[].content.parts[].text /
-	// finishReason / usageMetadata), so it round-trips into an OpenAI response.
-	vertexResponse := vertexGenerateContentResponse{
-		ResponseId: completionMockId,
-		Candidates: []vertexCandidate{
-			{
-				Content: vertexContent{
-					Parts: []vertexPart{
-						{Text: response},
-					},
-					Role: "model",
-				},
-				FinishReason: "STOP",
-				Index:        0,
-			},
-		},
-		UsageMetadata: &vertexUsageMetadata{
-			PromptTokenCount:     completionMockUsage.PromptTokens,
-			CandidatesTokenCount: completionMockUsage.CompletionTokens,
-			TotalTokenCount:      completionMockUsage.TotalTokens,
-		},
-	}
-
-	ctx.JSON(http.StatusOK, vertexResponse)
+	ctx.JSON(http.StatusOK, createVertexGenerateContentResponse(response, true))
 }
 
 func (p *vertexProvider) sendErrorResponse(ctx *gin.Context, statusCode int, message string) {
-	ctx.JSON(statusCode, gin.H{
-		"error": gin.H{
-			"code":    statusCode,
-			"message": message,
-			"status":  vertexErrorStatus(statusCode),
+	ctx.JSON(statusCode, vertexErrorResponse{
+		Error: vertexErrorDetail{
+			Code:    statusCode,
+			Message: message,
+			Status:  vertexErrorStatus(statusCode),
 		},
 	})
 }
@@ -296,4 +246,37 @@ type vertexUsageMetadata struct {
 	PromptTokenCount     int `json:"promptTokenCount"`
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+func createVertexGenerateContentResponse(response string, finished bool) vertexGenerateContentResponse {
+	candidate := vertexCandidate{
+		Content: vertexContent{
+			Parts: []vertexPart{{Text: response}},
+			Role:  "model",
+		},
+		Index: 0,
+	}
+	if finished {
+		candidate.FinishReason = "STOP"
+	}
+
+	return vertexGenerateContentResponse{
+		ResponseId: completionMockId,
+		Candidates: []vertexCandidate{candidate},
+		UsageMetadata: &vertexUsageMetadata{
+			PromptTokenCount:     completionMockUsage.PromptTokens,
+			CandidatesTokenCount: completionMockUsage.CompletionTokens,
+			TotalTokenCount:      completionMockUsage.TotalTokens,
+		},
+	}
+}
+
+type vertexErrorResponse struct {
+	Error vertexErrorDetail `json:"error"`
+}
+
+type vertexErrorDetail struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
 }
